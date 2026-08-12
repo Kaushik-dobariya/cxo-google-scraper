@@ -2,35 +2,28 @@
 CXO GOOGLE SCRAPER
 ==================
 
-Phase 1.1
----------
-Free company discovery from public web search results.
+PHASE 3.1
 
-IMPORTANT:
-- No Google Places API
-- No paid API
-- No proxy
-- No scraping service
-- No CAPTCHA bypass
+Public Contact Information Extraction
 
 Input:
-    input/search.csv
+    output/website_pages.csv
 
 Output:
-    output/companies.csv
+    output/page_contacts.csv
 """
 
 from __future__ import annotations
 
 import csv
+import re
 import time
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import urldefrag, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
 import config
-
 
 # ============================================================
 # HTTP SESSION
@@ -38,608 +31,677 @@ import config
 
 session = requests.Session()
 
-session.headers.update(
-    config.HEADERS
-)
+session.headers.update(config.HEADERS)
 
 
 # ============================================================
-# TEXT HELPERS
+# TEXT
 # ============================================================
+
 
 def clean_text(value: str) -> str:
-    """Clean unnecessary whitespace."""
+    """Normalize whitespace."""
 
     if not value:
         return ""
 
-    return " ".join(
-        value.split()
+    return re.sub(
+        r"\s+",
+        " ",
+        value,
     ).strip()
 
 
 # ============================================================
-# URL HELPERS
+# DOMAIN
 # ============================================================
 
-def get_domain(url: str) -> str:
-    """Return clean domain name from URL."""
 
-    try:
+def extract_domain(url: str) -> str:
+    """Extract normalized domain."""
 
-        parsed = urlparse(url)
-
-        domain = parsed.netloc.lower()
-
-        if domain.startswith("www."):
-            domain = domain[4:]
-
-        return domain
-
-    except Exception:
-
+    if not url:
         return ""
 
-
-def is_valid_url(url: str) -> bool:
-    """Check whether URL is HTTP/HTTPS."""
-
     try:
-
         parsed = urlparse(url)
-
-        return (
-            parsed.scheme in (
-                "http",
-                "https",
-            )
-            and bool(parsed.netloc)
-        )
-
-    except Exception:
-
-        return False
-
-
-def is_excluded_domain(url: str) -> bool:
-    """
-    Exclude search engines, social media,
-    directories, etc.
-    """
-
-    domain = get_domain(url)
-
-    if not domain:
-        return True
-
-    for excluded in config.EXCLUDED_DOMAINS:
-
-        if (
-            domain == excluded
-            or domain.endswith(
-                "." + excluded
-            )
-        ):
-            return True
-
-    return False
-
-
-# ============================================================
-# SEARCH RESULT URL
-# ============================================================
-
-def extract_real_url(href: str) -> str:
-    """
-    Extract actual destination URL.
-
-    DuckDuckGo may use redirect URLs containing
-    the 'uddg' parameter.
-    """
-
-    if not href:
+    except (TypeError, ValueError):
         return ""
 
-    href = href.strip()
-
-    # --------------------------------------------------------
-    # Absolute URL
-    # --------------------------------------------------------
-
-    if href.startswith(
-        (
-            "http://",
-            "https://",
-        )
-    ):
-
-        parsed = urlparse(href)
-
-        query = parse_qs(
-            parsed.query
-        )
-
-        if "uddg" in query:
-
-            return unquote(
-                query["uddg"][0]
-            )
-
-        return href
-
-    # --------------------------------------------------------
-    # Protocol-relative URL
-    # --------------------------------------------------------
-
-    if href.startswith("//"):
-
-        href = "https:" + href
-
-    # --------------------------------------------------------
-    # Relative URL
-    # --------------------------------------------------------
-
-    elif href.startswith("/"):
-
-        href = (
-            "https://html.duckduckgo.com"
-            + href
-        )
-
-    parsed = urlparse(href)
-
-    query = parse_qs(
-        parsed.query
-    )
-
-    if "uddg" in query:
-
-        return unquote(
-            query["uddg"][0]
-        )
-
-    return href
+    return (parsed.hostname or "").lower().removeprefix("www.")
 
 
 # ============================================================
-# SEARCH RESPONSE DIAGNOSTICS
+# EMAIL
 # ============================================================
 
-def diagnose_response(
-    response: requests.Response,
-) -> None:
-    """
-    Print useful diagnostics when the search engine
-    doesn't return the expected result structure.
-    """
-
-    print()
-    print(
-        "HTTP status :",
-        response.status_code,
-    )
-
-    print(
-        "Final URL   :",
-        response.url,
-    )
-
-    print(
-        "Content-Type:",
-        response.headers.get(
-            "Content-Type",
-            "",
-        ),
-    )
-
-    print(
-        "Response size:",
-        len(response.text),
-        "characters",
-    )
-
-    # --------------------------------------------------------
-    # Look for common indicators.
-    # --------------------------------------------------------
-
-    lower_html = response.text.lower()
-
-    indicators = [
-        "captcha",
-        "unusual traffic",
-        "robot",
-        "blocked",
-        "forbidden",
-        "access denied",
-        "challenge",
-    ]
-
-    found = [
-        item
-        for item in indicators
-        if item in lower_html
-    ]
-
-    if found:
-
-        print(
-            "Possible response indicators:",
-            ", ".join(found),
-        )
+EMAIL_PATTERN = re.compile(
+    r"""
+    (?<![\w.+-])
+    [A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+
+    @
+    [A-Za-z0-9-]+
+    (?:\.[A-Za-z0-9-]+)+
+    (?![\w.-])
+    """,
+    re.VERBOSE,
+)
 
 
-# ============================================================
-# DUCKDUCKGO SEARCH
-# ============================================================
+def extract_emails(
+    text: str,
+) -> list[str]:
+    """Extract visible email addresses."""
 
-def search_web(
-    query: str,
-    max_results: int,
-) -> list[dict]:
-    """
-    Search DuckDuckGo public HTML.
-
-    We use the current result-link selector:
-
-        .result__a
-    """
-
-    print()
-    print("-" * 70)
-    print(
-        f"SEARCHING: {query}"
-    )
-    print("-" * 70)
-
-    search_url = (
-        "https://html.duckduckgo.com/html/"
-    )
-
-    params = {
-        "q": query,
-        "kl": "in-en",
-    }
-
-    # --------------------------------------------------------
-    # Browser-like request headers.
-    # --------------------------------------------------------
-
-    headers = {
-        "Referer":
-            "https://html.duckduckgo.com/",
-        "Sec-Fetch-Dest":
-            "document",
-        "Sec-Fetch-Mode":
-            "navigate",
-        "Sec-Fetch-Site":
-            "same-origin",
-        "Sec-Fetch-User":
-            "?1",
-        "Upgrade-Insecure-Requests":
-            "1",
-    }
-
-    try:
-
-        response = session.get(
-            search_url,
-            params=params,
-            headers=headers,
-            timeout=config.REQUEST_TIMEOUT,
-        )
-
-        response.raise_for_status()
-
-    except requests.RequestException as error:
-
-        print(
-            "[ERROR] Search request failed:"
-        )
-
-        print(error)
-
+    if not text:
         return []
 
-    # --------------------------------------------------------
-    # Diagnostics
-    # --------------------------------------------------------
+    emails = []
 
-    diagnose_response(
-        response
+    seen = set()
+
+    for email in EMAIL_PATTERN.findall(text):
+
+        email = email.lower().strip()
+
+        domain = email.split("@")[-1]
+
+        if domain in (config.EXCLUDED_EMAIL_DOMAINS):
+            continue
+
+        if email in seen:
+            continue
+
+        seen.add(email)
+
+        emails.append(email)
+
+        if len(emails) >= (config.MAX_EMAILS_PER_PAGE):
+            break
+
+    return emails
+
+
+# ============================================================
+# PHONE
+# ============================================================
+
+PHONE_PATTERN = re.compile(
+    r"""
+    (?<!\w)
+    (?:
+        \+?\d{1,3}
+        [\s().-]*
+    )?
+    (?:\(?\d{2,5}\)?)
+    [\s.-]*
+    \d{3,5}
+    [\s.-]*
+    \d{3,5}
+    (?!\w)
+    """,
+    re.VERBOSE,
+)
+
+
+def normalize_phone(
+    value: str,
+) -> str:
+    """Normalize phone whitespace."""
+
+    return clean_text(value)
+
+
+def is_probable_phone(
+    value: str,
+) -> bool:
+    """Reject obviously invalid numeric strings."""
+
+    digits = re.sub(
+        r"\D",
+        "",
+        value,
     )
 
-    # --------------------------------------------------------
-    # Parse HTML.
-    # --------------------------------------------------------
+    return 7 <= len(digits) <= 15
+
+
+def extract_phone_numbers(
+    text: str,
+) -> list[str]:
+    """Extract probable phone numbers."""
+
+    if not text:
+        return []
+
+    phones = []
+
+    seen = set()
+
+    for phone in PHONE_PATTERN.findall(text):
+
+        phone = normalize_phone(phone)
+
+        if not is_probable_phone(phone):
+            continue
+
+        digits = re.sub(
+            r"\D",
+            "",
+            phone,
+        )
+
+        if digits in seen:
+            continue
+
+        seen.add(digits)
+
+        phones.append(phone)
+
+        if len(phones) >= (config.MAX_PHONES_PER_PAGE):
+            break
+
+    return phones
+
+
+# ============================================================
+# HTML CLEANING
+# ============================================================
+
+
+def clean_page_html(
+    html: str,
+) -> BeautifulSoup:
+    """Remove non-content HTML elements."""
 
     soup = BeautifulSoup(
-        response.text,
+        html,
         "lxml",
     )
 
-    # --------------------------------------------------------
-    # Current DDG result structure.
-    #
-    # Result:
-    #   .result
-    #
-    # Link:
-    #   .result__a
-    #
-    # Snippet:
-    #   .result__snippet
-    # --------------------------------------------------------
+    for element in soup(
+        [
+            "script",
+            "style",
+            "noscript",
+            "svg",
+            "canvas",
+            "iframe",
+            "template",
+        ]
+    ):
+        element.decompose()
 
-    result_blocks = soup.select(
-        ".result"
-    )
+    return soup
 
-    print(
-        "Result blocks found:",
-        len(result_blocks),
-    )
 
-    results = []
+# ============================================================
+# PAGE TITLE
+# ============================================================
 
-    for block in result_blocks:
 
-        # ----------------------------------------------------
-        # Find result link.
-        # ----------------------------------------------------
+def extract_page_title(
+    soup: BeautifulSoup,
+) -> str:
+    """Extract page title."""
 
-        link_element = block.select_one(
-            ".result__a"
+    if not soup.title:
+        return ""
+
+    return clean_text(
+        soup.title.get_text(
+            " ",
+            strip=True,
         )
+    )
 
-        if not link_element:
 
+# ============================================================
+# VISIBLE TEXT
+# ============================================================
+
+
+def extract_visible_text(
+    soup: BeautifulSoup,
+) -> str:
+    """Extract visible page text."""
+
+    text = soup.get_text(
+        " ",
+        strip=True,
+    )
+
+    text = clean_text(text)
+
+    if len(text) > (config.MAX_PAGE_TEXT_LENGTH):
+        text = text[: config.MAX_PAGE_TEXT_LENGTH]
+
+    return text
+
+
+# ============================================================
+# MAILTO EXTRACTION
+# ============================================================
+
+
+def extract_mailto_emails(soup: BeautifulSoup) -> list[str]:
+    """Extract valid email addresses from mailto links."""
+    emails: list[str] = []
+
+    for anchor in soup.find_all("a", href=True):
+        href = str(anchor.get("href", "")).strip()
+
+        if not href:
             continue
 
-        href = link_element.get(
+        if not href.casefold().startswith("mailto:"):
+            continue
+
+        email = href.removeprefix("mailto:").strip()
+
+        # Remove optional query parameters such as ?subject=...
+        email = email.split("?", 1)[0].strip()
+
+        if not email:
+            continue
+
+        if "@" not in email:
+            continue
+
+        emails.append(email)
+
+    return list(dict.fromkeys(emails))
+
+
+# ============================================================
+# TEL EXTRACTION
+# ============================================================
+
+
+def extract_tel_numbers(soup: BeautifulSoup) -> list[str]:
+    """Extract valid phone numbers from tel links."""
+    phones: list[str] = []
+
+    for anchor in soup.find_all("a", href=True):
+        href = str(anchor.get("href", "")).strip()
+
+        if not href:
+            continue
+
+        if not href.casefold().startswith("tel:"):
+            continue
+
+        phone = href.removeprefix("tel:").strip()
+
+        # Remove optional parameters such as ;ext=123.
+        phone = phone.split(";", 1)[0].strip()
+
+        if not phone:
+            continue
+
+        digits = re.sub(r"\D", "", phone)
+
+        if len(digits) < 7:
+            continue
+
+        phones.append(phone)
+
+    return list(dict.fromkeys(phones))
+
+
+# ============================================================
+# CONTACT PAGE DETECTION
+# ============================================================
+
+
+def is_contact_page(
+    page_url: str,
+    page_type: str,
+) -> bool:
+    """
+    Determine whether the page itself is a contact page.
+
+    This is deliberately based on the page URL/type,
+    NOT on whether a footer contains a Contact link.
+    """
+
+    if page_type == "contact":
+        return True
+
+    path = urlparse(page_url).path.lower()
+
+    segments = [segment for segment in path.split("/") if segment]
+
+    return any(
+        segment
+        in {
+            "contact",
+            "contact-us",
+            "contactus",
+            "get-in-touch",
+            "reach-us",
+            "talk-to-us",
+        }
+        for segment in segments
+    )
+
+
+# ============================================================
+# CONTACT LINKS
+# ============================================================
+
+
+def extract_contact_links(
+    soup: BeautifulSoup,
+    base_url: str,
+) -> list[str]:
+    """
+    Extract actual contact-related links.
+
+    This does NOT mean the page has contact information.
+    It only records that a contact destination exists.
+    """
+
+    links = []
+
+    seen = set()
+
+    for anchor in soup.find_all(
+        "a",
+        href=True,
+    ):
+
+        href = anchor.get(
             "href",
             "",
-        )
+        ).strip()
 
-        website = extract_real_url(
-            href
-        )
-
-        if not is_valid_url(
-            website
-        ):
-
-            continue
-
-        if is_excluded_domain(
-            website
-        ):
-
-            continue
-
-        # ----------------------------------------------------
-        # Title
-        # ----------------------------------------------------
-
-        title = clean_text(
-            link_element.get_text(
+        anchor_text = clean_text(
+            anchor.get_text(
                 " ",
                 strip=True,
             )
-        )
+        ).lower()
+
+        if not href:
+            continue
+
+        lower_href = href.lower()
 
         # ----------------------------------------------------
-        # Snippet
+        # Skip mailto/tel here because they are stored
+        # separately.
         # ----------------------------------------------------
 
-        snippet_element = (
-            block.select_one(
-                ".result__snippet"
+        if lower_href.startswith(
+            (
+                "mailto:",
+                "tel:",
             )
+        ):
+            continue
+
+        combined = f"{lower_href} " f"{anchor_text}"
+
+        if not any(keyword in combined for keyword in (config.CONTACT_LINK_KEYWORDS)):
+            continue
+
+        absolute_url = urljoin(
+            base_url,
+            href,
         )
 
-        description = ""
+        absolute_url, _ = urldefrag(absolute_url)
 
-        if snippet_element:
+        if absolute_url in seen:
+            continue
 
-            description = clean_text(
-                snippet_element.get_text(
-                    " ",
-                    strip=True,
-                )
-            )
+        seen.add(absolute_url)
 
-        results.append(
-            {
-                "title": title,
-                "website": website,
-                "description": description,
-            }
-        )
+        links.append(absolute_url)
 
-        if len(results) >= max_results:
-
+        if len(links) >= (config.MAX_CONTACT_LINKS_PER_PAGE):
             break
 
-    print(
-        "Usable results:",
-        len(results),
-    )
-
-    return results
+    return links
 
 
 # ============================================================
-# READ SEARCH CSV
+# FETCH
 # ============================================================
 
-def load_search_queries() -> list[str]:
-    """Read search.csv and build search queries."""
 
-    search_file = (
-        config.SEARCH_FILE
+def fetch_page(
+    url: str,
+) -> tuple[
+    requests.Response | None,
+    str,
+]:
+    """Download public HTML page."""
+
+    try:
+        response = session.get(
+            url,
+            timeout=config.REQUEST_TIMEOUT,
+            allow_redirects=True,
+        )
+    except requests.RequestException as error:
+        print(f"    [ERROR] {error}")
+        return None, ""
+
+    content_type = response.headers.get(
+        "Content-Type",
+        "",
+    ).lower()
+
+    if "text/html" not in content_type:
+        return response, ""
+
+    return response, response.text
+
+
+# ============================================================
+# PROCESS PAGE
+# ============================================================
+
+
+def process_page(
+    page: dict,
+) -> dict:
+    """Extract public contact information."""
+
+    page_url = page.get(
+        "page_url",
+        "",
     )
 
-    if not search_file.exists():
+    result = {
+        "company_name": page.get(
+            "company_name",
+            "",
+        ),
+        "company_domain": page.get(
+            "company_domain",
+            "",
+        ),
+        "page_url": page_url,
+        "page_type": page.get(
+            "page_type",
+            "",
+        ),
+        "score": page.get(
+            "score",
+            "",
+        ),
+        "page_title": "",
+        "final_url": "",
+        "status_code": "",
+        "emails": "",
+        "mailto_emails": "",
+        "phone_numbers": "",
+        "tel_numbers": "",
+        "contact_page": "NO",
+        "contact_links": "",
+        "page_text": "",
+        "error": "",
+    }
 
-        print()
-        print(
-            "[ERROR] Search file not found:"
-        )
+    if not page_url:
+        result["error"] = "Page URL is empty"
+        return result
 
-        print(
-            search_file
-        )
+    response, html = fetch_page(page_url)
 
+    if not response:
+        result["error"] = "Page request failed"
+        return result
+
+    result["status_code"] = response.status_code
+
+    result["final_url"] = response.url
+
+    if not html:
+        result["error"] = "Page did not return HTML"
+        return result
+
+    soup = clean_page_html(html)
+
+    result["page_title"] = extract_page_title(soup)
+
+    page_text = extract_visible_text(soup)
+
+    result["page_text"] = page_text
+
+    # --------------------------------------------------------
+    # Visible email addresses
+    # --------------------------------------------------------
+
+    visible_emails = extract_emails(page_text)
+
+    result["emails"] = "; ".join(visible_emails)
+
+    # --------------------------------------------------------
+    # Explicit mailto addresses
+    # --------------------------------------------------------
+
+    mailto_emails = extract_mailto_emails(soup)
+
+    result["mailto_emails"] = "; ".join(mailto_emails)
+
+    # --------------------------------------------------------
+    # Visible phone numbers
+    # --------------------------------------------------------
+
+    visible_phones = extract_phone_numbers(page_text)
+
+    result["phone_numbers"] = "; ".join(visible_phones)
+
+    # --------------------------------------------------------
+    # Explicit tel links
+    # --------------------------------------------------------
+
+    tel_numbers = extract_tel_numbers(soup)
+
+    result["tel_numbers"] = "; ".join(tel_numbers)
+
+    # --------------------------------------------------------
+    # Actual contact page
+    # --------------------------------------------------------
+
+    if is_contact_page(
+        page_url,
+        page.get(
+            "page_type",
+            "",
+        ),
+    ):
+        result["contact_page"] = "YES"
+
+    # --------------------------------------------------------
+    # Contact destinations
+    # --------------------------------------------------------
+
+    contact_links = extract_contact_links(
+        soup,
+        response.url,
+    )
+
+    result["contact_links"] = "; ".join(contact_links)
+
+    return result
+
+
+# ============================================================
+# LOAD DISCOVERED PAGES
+# ============================================================
+
+
+def load_pages() -> list[dict]:
+    """Load Phase 2 page discovery output."""
+
+    input_file = config.WEBSITE_PAGES_OUTPUT_FILE
+
+    if not input_file.exists():
+        print("[ERROR] " "website_pages.csv not found:")
+        print(input_file)
         return []
 
-    queries = []
+    try:
+        with open(
+            input_file,
+            "r",
+            encoding="utf-8-sig",
+            newline="",
+        ) as file:
 
-    with open(
-        search_file,
-        "r",
-        encoding="utf-8-sig",
-        newline="",
-    ) as file:
+            reader = csv.DictReader(file)
 
-        reader = csv.DictReader(
-            file
-        )
+            if not reader.fieldnames:
+                print("[ERROR] " "CSV has no header.")
+                return []
 
-        if not reader.fieldnames:
+            return list(reader)
 
-            print(
-                "[ERROR] search.csv has no header."
-            )
-
-            return []
-
-        required_columns = {
-            "keyword",
-            "location",
-        }
-
-        missing = (
-            required_columns
-            - set(reader.fieldnames)
-        )
-
-        if missing:
-
-            print(
-                "[ERROR] Missing columns:"
-            )
-
-            print(
-                ", ".join(missing)
-            )
-
-            return []
-
-        for row in reader:
-
-            keyword = clean_text(
-                row.get(
-                    "keyword",
-                    "",
-                )
-            )
-
-            location = clean_text(
-                row.get(
-                    "location",
-                    "",
-                )
-            )
-
-            if not keyword:
-
-                continue
-
-            if location:
-
-                query = (
-                    f"{keyword} "
-                    f"in {location}"
-                )
-
-            else:
-
-                query = keyword
-
-            queries.append(
-                query
-            )
-
-    return queries[
-        :config.MAX_SEARCH_QUERIES
-    ]
+    except OSError as error:
+        print("[ERROR] " "Could not read website pages:")
+        print(error)
+        return []
 
 
 # ============================================================
-# DUPLICATE REMOVAL
+# SAVE
 # ============================================================
 
-def remove_duplicates(
-    results: list[dict],
-) -> list[dict]:
-    """Remove duplicate websites by domain."""
-
-    unique = []
-
-    seen_domains = set()
-
-    for result in results:
-
-        website = result.get(
-            "website",
-            "",
-        )
-
-        domain = get_domain(
-            website
-        )
-
-        if not domain:
-
-            continue
-
-        if domain in seen_domains:
-
-            continue
-
-        seen_domains.add(
-            domain
-        )
-
-        unique.append(
-            result
-        )
-
-    return unique
-
-
-# ============================================================
-# SAVE RESULTS
-# ============================================================
 
 def save_results(
     results: list[dict],
 ) -> None:
-    """Save results to companies.csv."""
+    """Save Phase 3 results."""
 
     config.OUTPUT_DIR.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    output_file = (
-        config.COMPANIES_FILE
-    )
+    output_file = config.PAGE_CONTACTS_OUTPUT_FILE
 
     fieldnames = [
         "company_name",
-        "website",
-        "description",
+        "company_domain",
+        "page_url",
+        "page_type",
+        "score",
+        "page_title",
+        "final_url",
+        "status_code",
+        "emails",
+        "mailto_emails",
+        "phone_numbers",
+        "tel_numbers",
+        "contact_page",
+        "contact_links",
+        "page_text",
+        "error",
     ]
 
     with open(
@@ -656,223 +718,205 @@ def save_results(
 
         writer.writeheader()
 
-        for result in results:
-
-            writer.writerow(
-                {
-                    "company_name":
-                        result.get(
-                            "title",
-                            "",
-                        ),
-                    "website":
-                        result.get(
-                            "website",
-                            "",
-                        ),
-                    "description":
-                        result.get(
-                            "description",
-                            "",
-                        ),
-                }
-            )
+        writer.writerows(results)
 
     print()
     print("=" * 70)
-    print("OUTPUT CREATED")
+    print("CONTACT EXTRACTION OUTPUT")
     print("=" * 70)
 
-    print(
-        "File:",
-        output_file,
-    )
+    print(f"File: {output_file}")
 
-    print(
-        "Records:",
-        len(results),
-    )
+    print(f"Pages processed: " f"{len(results)}")
 
 
 # ============================================================
-# DISPLAY RESULTS
+# SUMMARY
 # ============================================================
 
-def display_results(
+
+def display_summary(
     results: list[dict],
 ) -> None:
+    """Display Phase 3 summary."""
 
     print()
     print("=" * 70)
-    print("DISCOVERED COMPANIES")
+    print("PHASE 3 RESULTS")
     print("=" * 70)
 
     if not results:
-
-        print(
-            "No companies discovered."
-        )
-
+        print("No pages processed.")
         return
 
-    for index, result in enumerate(
-        results,
-        start=1,
-    ):
-
-        print()
-        print(
-            f"{index}. "
-            f"{result.get('title', '')}"
+    successful_pages = sum(
+        1
+        for result in results
+        if str(
+            result.get(
+                "status_code",
+                "",
+            )
+        ).startswith(
+            (
+                "2",
+                "3",
+            )
         )
+    )
 
-        print(
-            f"   Website: "
-            f"{result.get('website', '')}"
+    pages_with_email = sum(
+        bool(
+            result.get(
+                "emails",
+                "",
+            )
+            or result.get(
+                "mailto_emails",
+                "",
+            )
         )
+        for result in results
+    )
+
+    pages_with_phone = sum(
+        bool(
+            result.get(
+                "phone_numbers",
+                "",
+            )
+            or result.get(
+                "tel_numbers",
+                "",
+            )
+        )
+        for result in results
+    )
+
+    contact_pages = sum(
+        result.get(
+            "contact_page",
+            "",
+        )
+        == "YES"
+        for result in results
+    )
+
+    pages_with_contact_link = sum(
+        bool(
+            result.get(
+                "contact_links",
+                "",
+            )
+        )
+        for result in results
+    )
+
+    print(f"Pages processed          : " f"{len(results)}")
+
+    print(f"Successful pages         : " f"{successful_pages}")
+
+    print(f"Pages with email         : " f"{pages_with_email}")
+
+    print(f"Pages with phone         : " f"{pages_with_phone}")
+
+    print(f"Actual contact pages    : " f"{contact_pages}")
+
+    print(f"Pages linking to contact: " f"{pages_with_contact_link}")
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-def main():
+
+def main() -> None:
+    """Run Phase 3."""
 
     print()
     print("=" * 70)
     print("CXO GOOGLE SCRAPER")
-    print("PHASE 1.1 - COMPANY DISCOVERY")
+    print("PHASE 3.1 - ACCURATE PUBLIC CONTACT EXTRACTION")
     print("=" * 70)
 
     print()
-    print(
-        "Cost policy:"
-    )
+    print("Cost policy:")
 
-    print(
-        "  Google Places API : NOT USED"
-    )
+    print("Google Places API : NOT USED")
 
-    print(
-        "  Paid API          : NOT USED"
-    )
+    print("Google Search API : NOT USED")
 
-    print(
-        "  Proxy             : NOT USED"
-    )
+    print("Paid API          : NOT USED")
 
-    print(
-        "  Scraping service  : NOT USED"
-    )
+    print("Proxy             : NOT USED")
 
-    # --------------------------------------------------------
-    # Load search queries.
-    # --------------------------------------------------------
+    print("Scraping service  : NOT USED")
 
-    queries = load_search_queries()
+    pages = load_pages()
 
-    if not queries:
-
-        print()
-        print(
-            "[ERROR] No search queries found."
-        )
-
+    if not pages:
+        print("[ERROR] " "No discovered pages available.")
+        print("Run Phase 2.3 first.")
         return
 
     print()
-    print(
-        f"Search queries loaded: "
-        f"{len(queries)}"
-    )
+    print(f"Pages loaded: " f"{len(pages)}")
 
-    # --------------------------------------------------------
-    # Search.
-    # --------------------------------------------------------
+    results = []
 
-    all_results = []
-
-    for index, query in enumerate(
-        queries,
+    for index, page in enumerate(
+        pages,
         start=1,
     ):
 
         print()
-        print(
-            f"QUERY "
-            f"{index}/"
-            f"{len(queries)}"
-        )
+        print("-" * 70)
 
-        results = search_web(
-            query,
-            config.MAX_RESULTS_PER_QUERY,
-        )
+        print(f"PAGE " f"{index}/" f"{len(pages)}")
 
-        all_results.extend(
-            results
-        )
+        print(f"Company: " f"{page.get('company_name', '')}")
 
-        if index < len(queries):
+        print(f"Type: " f"{page.get('page_type', '')}")
 
-            time.sleep(
-                config.REQUEST_DELAY
+        print(f"URL: " f"{page.get('page_url', '')}")
+
+        try:
+            result = process_page(page)
+        except (
+            AttributeError,
+            IndexError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as error:
+            print(
+                "[WARNING] Page skipped due to extraction error: "
+                f"{type(error).__name__}: {error}"
             )
+            continue
 
-    # --------------------------------------------------------
-    # Remove duplicates.
-    # --------------------------------------------------------
+        results.append(result)
 
-    print()
-    print("=" * 70)
-    print("REMOVING DUPLICATES")
-    print("=" * 70)
+        if index < len(pages):
+            time.sleep(config.REQUEST_DELAY)
 
-    before = len(
-        all_results
-    )
+    display_summary(results)
 
-    all_results = remove_duplicates(
-        all_results
-    )
-
-    after = len(
-        all_results
-    )
-
-    print(
-        f"Before: {before}"
-    )
-
-    print(
-        f"After : {after}"
-    )
-
-    # --------------------------------------------------------
-    # Display.
-    # --------------------------------------------------------
-
-    display_results(
-        all_results
-    )
-
-    # --------------------------------------------------------
-    # Save.
-    # --------------------------------------------------------
-
-    save_results(
-        all_results
-    )
+    save_results(results)
 
     print()
     print("=" * 70)
-    print("PHASE 1.1 FINISHED")
+    print("PHASE 3.1 COMPLETE")
     print("=" * 70)
 
+    print()
+    print("Accurate public contact extraction completed.")
 
-# ============================================================
-# ENTRY POINT
-# ============================================================
+    print()
+    print("Next phase:")
+
+    print("Phase 4 - CXO / Leadership Identification")
+
 
 if __name__ == "__main__":
     main()
